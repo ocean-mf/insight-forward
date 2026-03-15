@@ -227,18 +227,19 @@ class RAFTMotionAnalyzer:
     def compute_motion_centroid(
         self,
         flow: np.ndarray,
-    ) -> tuple[float, float, float, np.ndarray]:
+    ) -> tuple[float, float, float, np.ndarray, tuple[float, float, float, float]]:
         """
-        Derive the Weighted Motion Centroid from an optical-flow field.
+        Derive the Weighted Motion Centroid and bounding box from optical flow.
 
         Strategy:
             1. Compute flow magnitude map.
             2. Keep only the top-k% highest-magnitude pixels as weights.
             3. Compute the intensity-weighted centroid (x, y).
+            4. Derive a tight bounding box around the top-k region.
 
         Returns:
-            (cx, cy, saliency_score, magnitude_map)
-            saliency_score = mean magnitude over top-k% region.
+            (cx, cy, saliency_score, magnitude_map, bbox_xyxy)
+            bbox_xyxy = (x1, y1, x2, y2) bounding box of the top-k motion region.
         """
         mag = np.sqrt(flow[0] ** 2 + flow[1] ** 2).astype(np.float32)  # [H, W]
         H, W = mag.shape
@@ -253,14 +254,73 @@ class RAFTMotionAnalyzer:
         total = weights.sum()
 
         if total < 1e-6:
-            return W / 2.0, H / 2.0, 0.0, mag
+            bbox = (0.0, 0.0, float(W), float(H))
+            return W / 2.0, H / 2.0, 0.0, mag, bbox
 
         ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
         cx = float((weights * xs).sum() / total)
         cy = float((weights * ys).sum() / total)
         saliency = float(mag[top_k_mask].mean()) if top_k_mask.any() else 0.0
 
-        return cx, cy, saliency, mag
+        # Bounding box from the connected component containing the centroid.
+        # This avoids degeneracy when background motion (e.g. water ripples)
+        # scatters top-k pixels across the entire frame.
+        bbox = self._bbox_from_centroid_component(top_k_mask, cx, cy, H, W)
+
+        return cx, cy, saliency, mag, bbox
+
+    @staticmethod
+    def _bbox_from_centroid_component(
+        mask: np.ndarray, cx: float, cy: float, H: int, W: int,
+        max_area_frac: float = 0.4,
+        fallback_margin: float = 0.25,
+    ) -> tuple[float, float, float, float]:
+        """Return a tight bbox around the primary motion near (cx, cy).
+
+        Steps:
+          1. Erode the mask to disconnect weak bridges (e.g. water ripples).
+          2. Find the connected component under the centroid.
+          3. If the resulting bbox exceeds *max_area_frac* of the frame, fall
+             back to a margin-based box centred on the centroid.
+        """
+        diag = np.sqrt(H ** 2 + W ** 2)
+        kernel_size = max(3, int(diag * 0.015) | 1)  # odd, ~1.5% of diagonal
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
+
+        # If erosion wipes the centroid region, fall back to un-eroded mask
+        cy_i = max(0, min(int(round(cy)), H - 1))
+        cx_i = max(0, min(int(round(cx)), W - 1))
+        work_mask = eroded if eroded[cy_i, cx_i] else mask.astype(np.uint8)
+
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(work_mask, connectivity=8)
+        target_label = labels[cy_i, cx_i]
+
+        frame_area = float(H * W)
+
+        if target_label != 0 and n_labels > 1:
+            x1 = float(stats[target_label, cv2.CC_STAT_LEFT])
+            y1 = float(stats[target_label, cv2.CC_STAT_TOP])
+            w = float(stats[target_label, cv2.CC_STAT_WIDTH])
+            h = float(stats[target_label, cv2.CC_STAT_HEIGHT])
+            bbox_area = w * h
+            if bbox_area / frame_area <= max_area_frac:
+                # Pad the bbox by 20% on each side to account for erosion shrinkage
+                pad_x, pad_y = w * 0.2, h * 0.2
+                bx1 = max(0.0, x1 - pad_x)
+                by1 = max(0.0, y1 - pad_y)
+                bx2 = min(float(W - 1), x1 + w - 1 + pad_x)
+                by2 = min(float(H - 1), y1 + h - 1 + pad_y)
+                return (bx1, by1, bx2, by2)
+
+        # Fallback: margin-based box centred on the centroid
+        margin_x = W * fallback_margin
+        margin_y = H * fallback_margin
+        x1 = max(0.0, cx - margin_x)
+        y1 = max(0.0, cy - margin_y)
+        x2 = min(float(W - 1), cx + margin_x)
+        y2 = min(float(H - 1), cy + margin_y)
+        return (x1, y1, x2, y2)
 
     # ------------------------------------------------------------------
 
@@ -309,16 +369,24 @@ class SAM2Segmentor:
         frames_dir: str,
         prompt_frame_idx: int,
         centroid_xy: tuple[float, float],
+        bbox_xyxy: Optional[tuple[float, float, float, float]],
         num_frames: int,
         bidirectional: bool = True,
     ) -> dict[int, np.ndarray]:
         """
         Run SAM 2 on a directory of JPEG frames.
 
+        Prompt strategy (in order of preference):
+          1. If ``bbox_xyxy`` is provided, use it as a box prompt with the
+             centroid as an additional positive point inside the box.
+          2. Otherwise fall back to a single-point centroid prompt.
+
         Args:
             frames_dir:        Path to directory with ``00000.jpg``, ``00001.jpg``, …
             prompt_frame_idx:  Frame index where the motion centroid is injected.
             centroid_xy:       (x, y) pixel coordinates of the motion centroid.
+            bbox_xyxy:         (x1, y1, x2, y2) bounding box of the motion region,
+                               or None to use point-only prompting.
             num_frames:        Total number of frames.
             bidirectional:     If True, also propagate backward from the prompt frame.
 
@@ -341,17 +409,33 @@ class SAM2Segmentor:
                 offload_state_to_cpu=False,
             )
 
-            # Inject motion centroid as the foreground point prompt
-            points = np.array([[cx, cy]], dtype=np.float32)
-            labels = np.array([1], dtype=np.int32)  # 1 = foreground
-
-            predictor.add_new_points_or_box(
-                state,
-                frame_idx=prompt_frame_idx,
-                obj_id=1,
-                points=points,
-                labels=labels,
-            )
+            if bbox_xyxy is not None:
+                x1, y1, x2, y2 = bbox_xyxy
+                box = np.array([x1, y1, x2, y2], dtype=np.float32)
+                # Box prompt + centroid point for within-box disambiguation
+                points = np.array([[cx, cy]], dtype=np.float32)
+                labels = np.array([1], dtype=np.int32)
+                predictor.add_new_points_or_box(
+                    state,
+                    frame_idx=prompt_frame_idx,
+                    obj_id=1,
+                    points=points,
+                    labels=labels,
+                    box=box,
+                )
+                log.info("SAM 2 prompt: box=(%.0f,%.0f,%.0f,%.0f) + centroid=(%.1f,%.1f)",
+                         x1, y1, x2, y2, cx, cy)
+            else:
+                points = np.array([[cx, cy]], dtype=np.float32)
+                labels = np.array([1], dtype=np.int32)
+                predictor.add_new_points_or_box(
+                    state,
+                    frame_idx=prompt_frame_idx,
+                    obj_id=1,
+                    points=points,
+                    labels=labels,
+                )
+                log.info("SAM 2 prompt: point-only centroid=(%.1f,%.1f)", cx, cy)
 
             masks: dict[int, np.ndarray] = {}
 
@@ -487,12 +571,13 @@ class UVOSEngine:
 
         # Centroid per frame.  Frame i gets flow[i] (flow from i→i+1),
         # except the last frame which reuses flow[-1] (flow from N-2→N-1).
-        centroids: list[tuple[float, float, float, np.ndarray]] = []
+        centroids: list[tuple[float, float, float, np.ndarray, tuple[float, float, float, float]]] = []
         for i, flow in enumerate(flows):
-            cx, cy, sal, mag = self.raft.compute_motion_centroid(flow)
-            centroids.append((cx, cy, sal, mag))
+            cx, cy, sal, mag, bbox = self.raft.compute_motion_centroid(flow)
+            centroids.append((cx, cy, sal, mag, bbox))
         # Duplicate last entry for the final frame
-        centroids.append(centroids[-1] if centroids else (meta.width / 2, meta.height / 2, 0.0, None))
+        default_bbox = (0.0, 0.0, float(meta.width), float(meta.height))
+        centroids.append(centroids[-1] if centroids else (meta.width / 2, meta.height / 2, 0.0, None, default_bbox))
 
         if self.config.offload_raft_after_flow:
             self.raft.free_gpu_memory()
@@ -504,8 +589,9 @@ class UVOSEngine:
         else:
             prompt_frame_idx = min(prompt_frame_idx, meta.num_frames - 1)
 
-        cx_prompt, cy_prompt, _, _ = centroids[prompt_frame_idx]
-        log.info("Prompt frame %d | centroid=(%.1f, %.1f)", prompt_frame_idx, cx_prompt, cy_prompt)
+        cx_prompt, cy_prompt, _, _, bbox_prompt = centroids[prompt_frame_idx]
+        log.info("Prompt frame %d | centroid=(%.1f, %.1f) | bbox=(%.0f,%.0f,%.0f,%.0f)",
+                 prompt_frame_idx, cx_prompt, cy_prompt, *bbox_prompt)
 
         # ── 4. Write JPEG frames for SAM 2 ─────────────────────────────
         log.info("Writing frames for SAM 2…")
@@ -519,6 +605,7 @@ class UVOSEngine:
                 frames_dir=tmp_dir,
                 prompt_frame_idx=prompt_frame_idx,
                 centroid_xy=(cx_prompt, cy_prompt),
+                bbox_xyxy=bbox_prompt,
                 num_frames=meta.num_frames,
                 bidirectional=self.config.bidirectional_propagation,
             )
@@ -531,7 +618,7 @@ class UVOSEngine:
         empty_mask = np.zeros((H, W), dtype=bool)
 
         for i in range(meta.num_frames):
-            cx, cy, sal, mag = centroids[i]
+            cx, cy, sal, mag, _ = centroids[i]
             mask = masks.get(i, empty_mask)
 
             # Ensure mask matches frame resolution (SAM 2 may up-sample)
